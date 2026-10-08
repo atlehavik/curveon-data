@@ -92,9 +92,6 @@
  "cameroon": [
   "https://download.geofabrik.de/africa/cameroon-latest.osm.pbf"
  ],
- "canada": [
-  "https://download.geofabrik.de/north-america/canada-latest.osm.pbf"
- ],
  "canada-alberta": [
   "https://download.geofabrik.de/north-america/canada/alberta-latest.osm.pbf"
  ],
@@ -497,9 +494,6 @@
  "romania": [
   "https://download.geofabrik.de/europe/romania-latest.osm.pbf"
  ],
- "russia": [
-  "https://download.geofabrik.de/russia-latest.osm.pbf"
- ],
  "russia-central": [
   "https://download.geofabrik.de/russia/central-fed-district-latest.osm.pbf"
  ],
@@ -642,9 +636,6 @@
  ],
  "united-kingdom": [
   "https://download.geofabrik.de/europe/united-kingdom-latest.osm.pbf"
- ],
- "united-states-of-america": [
-  "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
  ],
  "united-states-of-america-alabama": [
   "https://download.geofabrik.de/north-america/us/alabama-latest.osm.pbf"
