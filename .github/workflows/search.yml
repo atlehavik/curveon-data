@@ -1,0 +1,51 @@
+name: Search indexes
+
+on:
+  schedule:
+    - cron: "0 2 3 * *" # monthly, after Geofabrik's daily extracts are fresh
+  workflow_dispatch:
+    inputs:
+      areas:
+        description: Comma-separated area ids, or all
+        default: all
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.plan.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: python3 plan.py "${{ inputs.areas || 'all' }}"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        group: ${{ fromJson(needs.plan.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install osmium
+      - run: ./build.sh "${{ matrix.group }}"
+
+  manifest:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 manifest.py && gh release upload search index.json --clobber
