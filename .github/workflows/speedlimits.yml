@@ -1,0 +1,59 @@
+name: Speed limits
+
+on:
+  schedule:
+    - cron: "0 4 5 * *" # monthly
+  workflow_dispatch:
+    inputs:
+      areas:
+        description: Comma-separated area ids (norway, finland, netherlands, belgium), or all
+        default: all
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      areas: ${{ steps.plan.outputs.areas }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: plan
+        run: |
+          want="${{ inputs.areas || 'all' }}"
+          [ "$want" = all ] && want="norway,finland,netherlands,belgium"
+          echo "areas=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$want")" >> "$GITHUB_OUTPUT"
+          gh release view speedlimits -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create speedlimits -R "$GITHUB_REPOSITORY" \
+            --title "Speed limits" --notes "Official speed limits per country for Curveon, built monthly from free government road data. See README."
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        area: ${{ fromJson(needs.plan.outputs.areas) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pyproj
+      - run: |
+          python3 build_speedlimits.py "${{ matrix.area }}" "${{ matrix.area }}.sqlite"
+          gzip -9 -c "${{ matrix.area }}.sqlite" > "${{ matrix.area }}.sqlite.gz"
+          ls -la "${{ matrix.area }}.sqlite.gz"
+          gh release upload speedlimits "${{ matrix.area }}.sqlite.gz" --clobber
+
+  manifest:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 manifest_speedlimits.py && gh release upload speedlimits index.json --clobber
