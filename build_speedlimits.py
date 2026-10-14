@@ -17,16 +17,25 @@ Not (yet): Sweden (Trafikverket's NVDB is CC0, but its API needs a registered ke
 The tablet shows the official limit for the road it is on, and falls back to OpenStreetMap's
 maxspeed where there is none (other countries, private roads).
 
+Norway's file also carries, from the same NVDB:
+  refs      the road number of each stretch of public road (vegnett, E/R/F/K), for the route
+            number signs in the next-turn card
+  priority  priority roads (object type 596 "Forkjørsveg"), for the priority road sign
+
 Format (read by app/.../SpeedLimits.kt):
   meta(key TEXT PRIMARY KEY, value TEXT)  source, licence, built
-  cells(cell INTEGER PRIMARY KEY, data BLOB)
+  cells(cell INTEGER PRIMARY KEY, data BLOB)      speed limits; value = km/h
+  refs(cell INTEGER PRIMARY KEY, data BLOB)       road numbers; value = category * 1000000 + number,
+                                                  category E=1, R(iksveg)=2, F(ylkesveg)=3, K(ommunal)=4
+  priority(cell INTEGER PRIMARY KEY, data BLOB)   priority roads; value = 1
     cell = (floor(lat*100) + 9000) * 100000 + (floor(lon*100) + 18000)  (0.01° squares)
-    data = runs of road in that square, each: varint point count, varint km/h, then the points as
+    data = runs of road in that square, each: varint point count, varint value, then the points as
            zigzag varints in 1e-5° (lat, lon): the first relative to the square's corner, the rest
            to the previous point. A run that crosses squares is stored in each of them.
 
 Usage: build_speedlimits.py <area id> <out.sqlite>   (needs pyproj for netherlands and belgium)
        SAMPLE=1 build_speedlimits.py …  fetches one page only, to try a source out
+       FYLKER=46 build_speedlimits.py norway …  only these counties (comma-separated), to try it out
 """
 import json
 import math
@@ -54,34 +63,74 @@ def get(url):
     raise SystemExit(f"gave up on {url}")
 
 
-def norway():
-    """(km/h, [(lat, lon), …]) for every speed limit on Norway's public roads, a county at a time in parallel."""
+def nvdb_counties(url_of, value_of, what):
+    """(value, [(lat, lon), …]) from an NVDB listing with geometry, a county at a time in parallel.
+    [url_of]: county number -> first page's URL; [value_of]: object -> value, or None to skip it."""
     fylker = [f["nummer"] for f in get("https://nvdbapiles.atlas.vegvesen.no/omrader/api/v4/fylker")]
+    if os.environ.get("FYLKER"):
+        fylker = [f for f in fylker if str(f) in os.environ["FYLKER"].split(",")]
 
     def county(nr):
-        # Full geometry, simplified here: NVDB's own geometritoleranse collapses curved pieces (in
-        # roundabouts and junctions) to a single point.
-        url = f"{NVDB}?vegsystemreferanse=E,R,F,K&fylke={nr}&inkluder=egenskaper,geometri&srid=4326&antall=1000"
+        url = url_of(nr)
         out = []
         while url:
             page = get(url)
             for o in page["objekter"]:
-                kmh = next((e.get("verdi") for e in o["egenskaper"] if e.get("id") == 2021), None)
+                value = value_of(o)
                 wkt = o.get("geometri", {}).get("wkt", "")
-                if not kmh or not wkt:
+                if not value or not wkt:
                     continue
                 # NVDB's EPSG:4326 WKT is "lat lon [z]"; a MULTILINESTRING has one part per (…).
                 for part in re.findall(r"\(([^()]+)\)", wkt):
                     pts = simplify([tuple(map(float, p.split()[:2])) for p in part.split(",")])
                     if len(pts) >= 2:
-                        out.append((int(kmh), pts))
+                        out.append((int(value), pts))
             url = page["metadata"].get("neste", {}).get("href") if page["metadata"]["returnert"] > 0 else None
-        print(f"  county {nr}: {len(out)} stretches", file=sys.stderr)
+            if os.environ.get("SAMPLE"):
+                break
+        print(f"  county {nr}: {len(out)} {what}", file=sys.stderr)
         return out
 
     with ThreadPoolExecutor(6) as pool:
         for part in pool.map(county, fylker):
             yield from part
+
+
+def norway():
+    """(km/h, [(lat, lon), …]) for every speed limit on Norway's public roads."""
+    # Full geometry, simplified here: NVDB's own geometritoleranse collapses curved pieces (in
+    # roundabouts and junctions) to a single point.
+    return nvdb_counties(
+        lambda nr: f"{NVDB}?vegsystemreferanse=E,R,F,K&fylke={nr}&inkluder=egenskaper,geometri&srid=4326&antall=1000",
+        lambda o: next((e.get("verdi") for e in o["egenskaper"] if e.get("id") == 2021), None),
+        "speed limits")
+
+
+CATEGORIES = {"E": 1, "R": 2, "F": 3, "K": 4}
+
+
+def norway_refs():
+    """(category * 1000000 + number, [(lat, lon), …]) for the road number of every stretch of public
+    road that is open (fase V) and for vehicles (not footways and cycle paths)."""
+    def value(o):
+        ref = o.get("vegsystemreferanse", {})
+        vs = ref.get("vegsystem", {})
+        if vs.get("fase") != "V" or ref.get("strekning", {}).get("trafikantgruppe") != "K":
+            return None
+        cat = CATEGORIES.get(vs.get("vegkategori"))
+        return cat * 1000000 + vs["nummer"] if cat and vs.get("nummer") else None
+    return nvdb_counties(
+        lambda nr: f"https://nvdbapiles.atlas.vegvesen.no/vegnett/api/v4/veglenkesekvenser/segmentert"
+                   f"?vegsystemreferanse=E,R,F,K&fylke={nr}&srid=4326&antall=1000",
+        value, "road number stretches")
+
+
+def norway_priority():
+    """(1, [(lat, lon), …]) for every priority road (Forkjørsveg)."""
+    return nvdb_counties(
+        lambda nr: f"https://nvdbapiles.atlas.vegvesen.no/vegobjekter/api/v4/vegobjekter/596"
+                   f"?fylke={nr}&inkluder=geometri&srid=4326&antall=1000",
+        lambda o: 1, "priority roads")
 
 
 def wfs(base, layer, value, crs=None, page=10000, sort=None, workers=6):
@@ -240,10 +289,29 @@ def zigzag(n):
     return (n << 1) ^ (n >> 63)
 
 
+# Further tables a country's file carries besides the speed limits (see the format above).
+EXTRA = {"norway": {"refs": norway_refs, "priority": norway_priority}}
+
+
 def build(area, out_path):
     fetch, source, licence = SOURCES[area]
-    runs = defaultdict(list)  # cell -> [(kmh, [(lat5, lon5), …])]
-    for kmh, pts in fetch():
+    db = sqlite3.connect(out_path)
+    db.execute("DROP TABLE IF EXISTS meta")
+    db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    write_runs(db, "cells", fetch())
+    for table, extra in EXTRA.get(area, {}).items():
+        write_runs(db, table, extra())
+    db.executemany("INSERT INTO meta VALUES (?, ?)", [("source", source), ("licence", licence),
+                                                      ("built", time.strftime("%Y-%m-%d"))])
+    db.commit()
+    db.execute("VACUUM")
+    db.close()
+
+
+def write_runs(db, table, items):
+    """(value, [(lat, lon), …]) into [table], cut into 0.01° squares (see the format above)."""
+    runs = defaultdict(list)  # cell -> [(value, [(lat5, lon5), …])]
+    for kmh, pts in items:
         q = [(round(lat * 1e5), round(lon * 1e5)) for lat, lon in pts]
         # Each segment goes to every square its box touches; consecutive segments in one square
         # stay one run.
@@ -261,11 +329,8 @@ def build(area, out_path):
                     run = [a, b]
                     open_runs[c] = run
                     runs[c].append((kmh, run))
-    db = sqlite3.connect(out_path)
-    db.execute("DROP TABLE IF EXISTS cells")
-    db.execute("DROP TABLE IF EXISTS meta")
-    db.execute("CREATE TABLE cells(cell INTEGER PRIMARY KEY, data BLOB NOT NULL)")
-    db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    db.execute(f"DROP TABLE IF EXISTS {table}")
+    db.execute(f"CREATE TABLE {table}(cell INTEGER PRIMARY KEY, data BLOB NOT NULL)")
     for c, rs in runs.items():
         lat0 = (c // 100000 - 9000) * 1000
         lon0 = (c % 100000 - 18000) * 1000
@@ -278,13 +343,8 @@ def build(area, out_path):
                 varint(zigzag(la - plat), out)
                 varint(zigzag(lo - plon), out)
                 plat, plon = la, lo
-        db.execute("INSERT INTO cells VALUES (?, ?)", (c, bytes(out)))
-    db.executemany("INSERT INTO meta VALUES (?, ?)", [("source", source), ("licence", licence),
-                                                      ("built", time.strftime("%Y-%m-%d"))])
-    db.commit()
-    db.execute("VACUUM")
-    db.close()
-    print(f"{area}: {len(runs)} squares", file=sys.stderr)
+        db.execute(f"INSERT INTO {table} VALUES (?, ?)", (c, bytes(out)))
+    print(f"{table}: {len(runs)} squares", file=sys.stderr)
 
 
 if __name__ == "__main__":
