@@ -21,6 +21,8 @@ Norway's file also carries, from the same NVDB:
   refs      the road number of each stretch of public road (vegnett, E/R/F/K), for the route
             number signs in the next-turn card
   priority  priority roads (object type 596 "Forkjørsveg"), for the priority road sign
+  giveway   give way and stop signs (object type 96 "Skiltplate", 202 Vikeplikt and 204 Stopp), for
+            the give way sign while navigating
 
 Format (read by app/.../SpeedLimits.kt):
   meta(key TEXT PRIMARY KEY, value TEXT)  source, licence, built
@@ -28,6 +30,13 @@ Format (read by app/.../SpeedLimits.kt):
   refs(cell INTEGER PRIMARY KEY, data BLOB)       road numbers; value = category * 1000000 + number,
                                                   category E=1, R(iksveg)=2, F(ylkesveg)=3, K(ommunal)=4
   priority(cell INTEGER PRIMARY KEY, data BLOB)   priority roads; value = 1
+  giveway(cell INTEGER PRIMARY KEY, data BLOB)    give way (202) and stop (204) signs; each a run of
+                                                  2 points 10 m apart on the road at the sign;
+                                                  value = sign * 10 + kind:
+                                                    0  for traffic along the road from the 1st point
+                                                       towards the 2nd
+                                                    1  for traffic coming out of a side road on the
+                                                       right of 1st -> 2nd, 2 on the left, 3 either
     cell = (floor(lat*100) + 9000) * 100000 + (floor(lon*100) + 18000)  (0.01° squares)
     data = runs of road in that square, each: varint point count, varint value, then the points as
            zigzag varints in 1e-5° (lat, lon): the first relative to the square's corner, the rest
@@ -37,6 +46,7 @@ Usage: build_speedlimits.py <area id> <out.sqlite>   (needs pyproj for netherlan
        SAMPLE=1 build_speedlimits.py …  fetches one page only, to try a source out
        FYLKER=46 build_speedlimits.py norway …  only these counties (comma-separated), to try it out
 """
+import functools
 import json
 import math
 import os
@@ -109,10 +119,113 @@ def norway():
 CATEGORIES = {"E": 1, "R": 2, "F": 3, "K": 4}
 
 
+SIGNS = {7642: 202, 7643: 204}  # NVDB Skiltnummer enum id -> sign: 202 Vikeplikt, 204 Stopp
+# Where a sign's face points (Ansiktsside, rettet mot) -> mode in the yield table: traffic along
+# the road the sign is registered on, or traffic coming out of a side road onto it.
+FACING = {"Trafikk i metreringsretning": "along", "Trafikk mot metreringsretning": "against",
+          "Parallelt fra veg": "side", "Parallelt mot veg": "side"}
+
+
+@functools.cache
+def norway_signs():
+    """Every give way and stop sign on a public road: (sign, mode, veglenkesekvens id, relative
+    position, +1/-1 metering direction along the veglenkesekvens, side "H"/"V"/None in metering
+    direction)."""
+    fylker = [f["nummer"] for f in get("https://nvdbapiles.atlas.vegvesen.no/omrader/api/v4/fylker")]
+    if os.environ.get("FYLKER"):
+        fylker = [f for f in fylker if str(f) in os.environ["FYLKER"].split(",")]
+
+    def county(nr):
+        url = (f"{NVDB.rsplit('/', 1)[0]}/96?egenskap=({'%20OR%20'.join(f'5530={s}' for s in SIGNS)})"
+               f"&fylke={nr}&inkluder=egenskaper,lokasjon&srid=4326&antall=1000")
+        out = []
+        while url:
+            page = get(url)
+            for o in page["objekter"]:
+                props = {e.get("id"): e for e in o["egenskaper"]}
+                sign = SIGNS.get(props.get(5530, {}).get("enum_id"))
+                mode = FACING.get(props.get(1894, {}).get("verdi"))
+                loc = o.get("lokasjon", {})
+                st = (loc.get("stedfestinger") or [{}])[0]
+                ref = (loc.get("vegsystemreferanser") or [{}])[0]
+                metering = ref.get("strekning", {}).get("retning")
+                if not sign or not mode or st.get("type") != "Punkt" or metering not in ("MED", "MOT"):
+                    continue
+                side = ref.get("metrertLokasjon", {}).get("sideposisjon")
+                out.append((sign, mode, st["veglenkesekvensid"], st["relativPosisjon"],
+                            1 if metering == "MED" else -1, side if side in ("H", "V") else None))
+            url = page["metadata"].get("neste", {}).get("href") if page["metadata"]["returnert"] > 0 else None
+            if os.environ.get("SAMPLE"):
+                break
+        print(f"  county {nr}: {len(out)} give way and stop signs", file=sys.stderr)
+        return out
+
+    with ThreadPoolExecutor(6) as pool:
+        return [s for part in pool.map(county, fylker) for s in part]
+
+
+# veglenkesekvens id -> [(startposisjon, sluttposisjon, [(lat, lon), …])] for those with a sign,
+# kept by norway_refs while it reads the road network.
+SEQUENCES = defaultdict(list)
+
+
+def norway_yield():
+    """Give way and stop signs as short stretches of road (see the format above)."""
+    for sign, mode, seq, pos, metering, side in norway_signs():
+        seg = next((s for s in SEQUENCES.get(seq, []) if s[0] <= pos <= s[1]), None)
+        if not seg:
+            continue  # on a road not in the network read (a separate carriageway, a ramp)
+        start, end, pts = seg
+        line = road_around(pts, (pos - start) / (end - start) if end > start else 0.0)
+        if not line:
+            continue
+        a, b = line
+        m = b if metering > 0 else (2 * a[0] - b[0], 2 * a[1] - b[1])  # a -> m: metering direction
+        if mode == "side":
+            yield sign * 10 + {"H": 1, "V": 2}.get(side, 3), [a, m]
+        elif mode == "along":
+            yield sign * 10, [a, m]
+        else:
+            yield sign * 10, [a, (2 * a[0] - m[0], 2 * a[1] - m[1])]
+
+
+def road_around(pts, frac):
+    """The point [frac] of the way along [pts] and one 10 m further on; None when [pts] has no length."""
+    kx = math.cos(math.radians(pts[0][0])) * 111_320.0
+    lens = [math.hypot((q[1] - p[1]) * kx, (q[0] - p[0]) * 110_574.0) for p, q in zip(pts, pts[1:])]
+    total = sum(lens)
+    if total <= 0:
+        return None
+
+    def at(d):
+        d = max(0.0, min(total, d))
+        for (p, q), l in zip(zip(pts, pts[1:]), lens):
+            if d <= l and l > 0:
+                t = d / l
+                return p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])
+            d -= l
+        return pts[-1]
+
+    d = frac * total
+    a = at(d)
+    if d + 10 <= total:
+        return a, at(d + 10)
+    c = at(d - 10)  # the sign sits near the end: the 10 m before it, carried on past
+    return a, (2 * a[0] - c[0], 2 * a[1] - c[1])
+
+
 def norway_refs():
     """(category * 1000000 + number, [(lat, lon), …]) for the road number of every stretch of public
     road that is open (fase V) and for vehicles (not footways and cycle paths)."""
+    wanted = {s[2] for s in norway_signs()}
+
     def value(o):
+        if o.get("veglenkesekvensid") in wanted:
+            wkt = o.get("geometri", {}).get("wkt", "")
+            m = re.search(r"\(([^()]+)\)", wkt)
+            if m and o.get("sluttposisjon") is not None:
+                SEQUENCES[o["veglenkesekvensid"]].append(
+                    (o["startposisjon"], o["sluttposisjon"], [tuple(map(float, p.split()[:2])) for p in m.group(1).split(",")]))
         ref = o.get("vegsystemreferanse", {})
         vs = ref.get("vegsystem", {})
         if vs.get("fase") != "V" or ref.get("strekning", {}).get("trafikantgruppe") != "K":
@@ -290,7 +403,7 @@ def zigzag(n):
 
 
 # Further tables a country's file carries besides the speed limits (see the format above).
-EXTRA = {"norway": {"refs": norway_refs, "priority": norway_priority}}
+EXTRA = {"norway": {"refs": norway_refs, "priority": norway_priority, "giveway": norway_yield}}
 
 
 def build(area, out_path):

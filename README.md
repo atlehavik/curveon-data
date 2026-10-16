@@ -27,6 +27,7 @@ Official speed limits per country, for the speed sign: one small SQLite file eac
 `tools/speedlimits/build_speedlimits.py`) and published as assets of the
 [`speedlimits` release](../../releases/tag/speedlimits), with `index.json` listing them. Curveon
 uses them where present and OpenStreetMap's `maxspeed` elsewhere.
+Norway's file also has road numbers, priority roads and give way/stop signs from the same NVDB.
 
 | Area | Source | Licence |
 |---|---|---|
